@@ -1,0 +1,29 @@
+[Unit]
+Description=Radicale CalDAV backed by WebDAV
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=radicale
+Group=radicale
+WorkingDirectory=/opt/radicale-webdav-storage
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/radicale-webdav-storage/.venv/bin/radicale --config /etc/radicale-webdav/config
+Restart=on-failure
+RestartSec=3s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

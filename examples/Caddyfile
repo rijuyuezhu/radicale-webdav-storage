@@ -1,0 +1,20 @@
+https://dav.example.com {
+    basic_auth {
+        calendar REPLACE_WITH_CADDY_HASH_PASSWORD_OUTPUT
+    }
+
+    redir /caldav /caldav/ 308
+    redir /.well-known/caldav /caldav/ 308
+
+    handle /caldav/* {
+        reverse_proxy 127.0.0.1:5232 {
+            header_up X-Script-Name /caldav
+            header_up X-Remote-User {http.auth.user.id}
+        }
+    }
+
+    # Do not expose the backing WebDAV storage through this public host.
+    handle {
+        respond 404
+    }
+}
