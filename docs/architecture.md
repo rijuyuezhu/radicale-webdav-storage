@@ -112,3 +112,18 @@ Radicale worker B ─┘
 ```
 
 Process-local locks cannot coordinate two writers. Multi-process or active-active deployment is intentionally outside this product's scope.
+
+## Short-lived read caching
+
+The single Radicale process holds a 15-second in-memory cache of successful
+backing WebDAV `GET` and `PROPFIND` responses. This avoids repeatedly fetching
+all iCalendar resources when several CalDAV clients query or sync the same
+calendar. Every attempted `PUT`, `DELETE`, `MOVE`, or `MKCOL` invalidates the
+entire cache *before* performing the mutation, including when the response is
+lost or fails. Cache entries also expire automatically, and the cache is bounded.
+
+This is an optimization, not a source of truth: the WebDAV tree remains the
+only durable state. As with the process-wide lock, this assumes only the
+single Radicale process writes to the backing calendar directory. External
+WebDAV edits may remain invisible for up to the cache TTL; writing the
+underlying files directly is not a supported workflow.

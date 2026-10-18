@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import time
 import urllib.parse
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import cast
 
 import httpx
 
@@ -33,6 +35,7 @@ class WebDAVClient:
         timeout: float = 30.0,
         verify_tls: bool = True,
         client: httpx.Client | None = None,
+        cache_ttl: float = 15.0,
     ) -> None:
         if not base_url:
             raise ValueError("webdav_url must not be empty")
@@ -43,6 +46,12 @@ class WebDAVClient:
         self._base_path = urllib.parse.unquote(urllib.parse.urlsplit(self.base_url).path).rstrip(
             "/"
         )
+        # Only this Radicale process writes to the backing WebDAV root.
+        # Its storage lock serializes reads and mutations, so a short-lived
+        # read cache prevents repeated full-calendar scans from saturating
+        # the slow remote origin. No data is persisted in this cache.
+        self._cache_ttl = cache_ttl
+        self._cache: dict[tuple[str, str, int], tuple[float, object]] = {}
         self._owns_client = client is None
         self._client = client or httpx.Client(
             auth=(username, password) if username or password else None,
@@ -50,6 +59,19 @@ class WebDAVClient:
             verify=verify_tls,
             follow_redirects=True,
         )
+
+    def _cached(self, key: tuple[str, str, int]) -> object | None:
+        cached = self._cache.get(key)
+        if cached is not None and cached[0] > time.monotonic():
+            return cached[1]
+        return None
+
+    def _remember(self, key: tuple[str, str, int], value: object) -> None:
+        if self._cache_ttl <= 0:
+            return
+        if len(self._cache) >= 512:
+            self._cache.clear()
+        self._cache[key] = (time.monotonic() + self._cache_ttl, value)
 
     def close(self) -> None:
         if self._owns_client:
@@ -98,6 +120,10 @@ class WebDAVClient:
         return element.text
 
     def propfind(self, path: str, *, depth: int, collection: bool = True) -> list[WebDAVEntry]:
+        key = ("PROPFIND", self._url(path, collection=collection), depth)
+        cached = self._cached(key)
+        if cached is not None:
+            return list(cast(tuple[WebDAVEntry, ...], cached))
         body = b"""<?xml version=\"1.0\" encoding=\"utf-8\"?>
 <D:propfind xmlns:D=\"DAV:\"><D:prop>
 <D:resourcetype/><D:getetag/><D:getlastmodified/><D:getcontenttype/>
@@ -149,6 +175,7 @@ class WebDAVClient:
                     content_type=self._property(selected_prop, "getcontenttype"),
                 )
             )
+        self._remember(key, tuple(result))
         return result
 
     def stat(self, path: str, *, collection: bool) -> WebDAVEntry | None:
@@ -167,26 +194,29 @@ class WebDAVClient:
         return [entry for entry in entries if entry.path != clean]
 
     def get(self, path: str) -> str | None:
-        response = self._client.get(self._url(path))
-        if response.status_code == 404:
-            return None
-        if response.status_code != 200:
-            raise WebDAVError(
-                f"GET {path!r} failed: HTTP {response.status_code} {response.reason_phrase}"
-            )
-        return response.content.decode("utf-8")
+        content = self.get_bytes(path)
+        return None if content is None else content.decode("utf-8")
 
     def get_bytes(self, path: str) -> bytes | None:
-        response = self._client.get(self._url(path))
+        url = self._url(path)
+        key = ("GET", url, 0)
+        cached = self._cached(key)
+        if cached is not None:
+            return cast(bytes, cached)
+        response = self._client.get(url)
         if response.status_code == 404:
             return None
         if response.status_code != 200:
             raise WebDAVError(
                 f"GET {path!r} failed: HTTP {response.status_code} {response.reason_phrase}"
             )
+        self._remember(key, response.content)
         return response.content
 
     def put(self, path: str, content: bytes, *, content_type: str) -> None:
+        # Invalidate before the mutation: even a lost response may hide a
+        # successful backend write.
+        self._cache.clear()
         response = self._client.put(
             self._url(path),
             headers={"Content-Type": content_type},
@@ -198,6 +228,7 @@ class WebDAVClient:
             )
 
     def mkcol(self, path: str) -> None:
+        self._cache.clear()
         response = self._client.request("MKCOL", self._url(path, collection=True))
         if response.status_code in {200, 201, 204}:
             return
@@ -224,6 +255,7 @@ class WebDAVClient:
                 raise WebDAVError(f"expected collection at {current_path!r}")
 
     def delete(self, path: str, *, collection: bool = False, missing_ok: bool = True) -> None:
+        self._cache.clear()
         response = self._client.request("DELETE", self._url(path, collection=collection))
         if response.status_code in {200, 202, 204}:
             return
@@ -234,6 +266,7 @@ class WebDAVClient:
         )
 
     def move(self, source: str, destination: str) -> bool:
+        self._cache.clear()
         response = self._client.request(
             "MOVE",
             self._url(source),
