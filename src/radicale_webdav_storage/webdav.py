@@ -192,15 +192,17 @@ class WebDAVClient:
             if href_element is None or not href_element.text:
                 continue
             relative_path = self._relative_path_from_href(href_element.text)
-            selected_prop: ET.Element | None = None
+            selected_prop = ET.Element(f"{{{_DAV}}}prop")
             for propstat in dav_response.findall(f"{{{_DAV}}}propstat"):
                 status = propstat.find(f"{{{_DAV}}}status")
                 if status is None or not status.text or " 200 " not in status.text:
                     continue
-                selected_prop = propstat.find(f"{{{_DAV}}}prop")
-                if selected_prop is not None:
-                    break
-            if selected_prop is None:
+                prop = propstat.find(f"{{{_DAV}}}prop")
+                if prop is not None:
+                    for property_element in prop:
+                        if selected_prop.find(property_element.tag) is None:
+                            selected_prop.append(property_element)
+            if not len(selected_prop):
                 continue
             resource_type = selected_prop.find(f"{{{_DAV}}}resourcetype")
             is_collection = (
@@ -227,7 +229,7 @@ class WebDAVClient:
         for entry in entries:
             if entry.path == target:
                 return entry
-        return entries[0]
+        return None
 
     def list(self, path: str) -> list[WebDAVEntry]:
         clean = self._clean_path(path)

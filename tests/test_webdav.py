@@ -100,3 +100,57 @@ def test_mkcol_405_fails_when_collection_does_not_exist() -> None:
 
     with pytest.raises(WebDAVError, match="MKCOL 'alice' failed: HTTP 405"):
         client.mkcol("alice")
+
+
+def test_propfind_combines_properties_from_separate_successful_propstats() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            207,
+            content=b"""<?xml version="1.0"?>
+<D:multistatus xmlns:D="DAV:">
+ <D:response>
+  <D:href>/root/alice/</D:href>
+  <D:propstat>
+   <D:prop><D:getlastmodified>Mon, 01 Jan 2024 00:00:00 GMT</D:getlastmodified></D:prop>
+   <D:status>HTTP/1.1 200 OK</D:status>
+  </D:propstat>
+  <D:propstat>
+   <D:prop><D:getetag>"abc"</D:getetag>
+    <D:resourcetype><D:collection/></D:resourcetype></D:prop>
+   <D:status>HTTP/1.1 200 OK</D:status>
+  </D:propstat>
+  <D:propstat>
+   <D:prop><D:getcontenttype>text/plain</D:getcontenttype></D:prop>
+   <D:status>HTTP/1.1 404 Not Found</D:status>
+  </D:propstat>
+ </D:response>
+</D:multistatus>""",
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        entry = WebDAVClient("https://dav.example/root/", client=http).stat(
+            "alice", collection=True
+        )
+        assert entry is not None
+        assert entry.is_collection
+        assert entry.etag == '"abc"'
+        assert entry.last_modified == "Mon, 01 Jan 2024 00:00:00 GMT"
+        assert entry.content_type is None
+
+
+def test_stat_does_not_accept_wrong_href_in_depth_zero_result() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            207,
+            content=b"""<D:multistatus xmlns:D="DAV:">
+ <D:response><D:href>/root/alice/other.ics</D:href>
+  <D:propstat><D:prop><D:resourcetype/><D:getetag>"x"</D:getetag></D:prop>
+  <D:status>HTTP/1.1 200 OK</D:status></D:propstat>
+ </D:response>
+</D:multistatus>""",
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        client = WebDAVClient("https://dav.example/root/", client=http)
+        assert client.stat("alice/missing.ics", collection=False) is None
+        assert client.stat("alice/other.ics", collection=False) is not None

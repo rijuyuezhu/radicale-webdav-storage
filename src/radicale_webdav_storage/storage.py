@@ -69,12 +69,41 @@ class Collection(storage.BaseCollection):
     def _item_href(self, entry: WebDAVEntry) -> str:
         return posixpath.basename(entry.path.rstrip("/"))
 
-    def _item_from_entry(self, entry: WebDAVEntry) -> radicale_item.Item | None:
+    def _is_item_entry(self, entry: WebDAVEntry) -> bool:
         if entry.is_collection:
+            return False
+        href = self._item_href(entry)
+        if href == _METADATA_FILENAME or not pathutils.is_safe_filesystem_path_component(href):
+            return False
+
+        tag = self.tag
+        if tag == "VCALENDAR":
+            extension, other_extension = ".ics", ".vcf"
+            media_types = {"text/calendar", "text/x-vcalendar", "application/ics"}
+        elif tag == "VADDRESSBOOK":
+            extension, other_extension = ".vcf", ".ics"
+            media_types = {"text/vcard", "text/x-vcard"}
+        else:
+            return False
+
+        # CalDAV resource names are not required to have a .ics/.vcf suffix.
+        # Prefer a matching content type, but also accept the normal suffix
+        # when the backing WebDAV server returns a generic MIME type.
+        mime = (entry.content_type or "").split(";", 1)[0].strip().lower()
+        if mime in media_types:
+            return True
+        if href.lower().endswith(other_extension):
+            return False
+        if href.lower().endswith(extension):
+            return True
+        # Preserve extensionless resources with unknown MIME types, while
+        # ignoring ordinary stray files such as .txt and .bak.
+        return "." not in href and mime in {"", "application/octet-stream"}
+
+    def _item_from_entry(self, entry: WebDAVEntry) -> radicale_item.Item | None:
+        if not self._is_item_entry(entry):
             return None
         href = self._item_href(entry)
-        if href == _METADATA_FILENAME:
-            return None
         text = self._storage._client.get(entry.path, etag=entry.etag)
         if text is None:
             return None
@@ -87,9 +116,7 @@ class Collection(storage.BaseCollection):
 
     def get_all(self) -> Iterable[radicale_item.Item]:
         entries = [
-            entry
-            for entry in self._storage._client.list(self.path)
-            if not entry.is_collection and self._item_href(entry) != _METADATA_FILENAME
+            entry for entry in self._storage._client.list(self.path) if self._is_item_entry(entry)
         ]
         self._storage._client.prefetch(entries)
         for entry in entries:
@@ -118,7 +145,7 @@ class Collection(storage.BaseCollection):
                 if not entry.is_collection and self._item_href(entry) in requested
             }
         valid = [
-            entry for entry in entries.values() if entry is not None and not entry.is_collection
+            entry for entry in entries.values() if entry is not None and self._is_item_entry(entry)
         ]
         self._storage._client.prefetch(valid)
         for href in unique_hrefs:
@@ -284,7 +311,7 @@ class Storage(storage.BaseStorage):
         children = [
             entry
             for entry in self._client.list(sane_path)
-            if posixpath.basename(entry.path.rstrip("/")) != _METADATA_FILENAME
+            if (entry.is_collection or collection._is_item_entry(entry))
         ]
         # A caller-provided context may enforce per-item access. In that
         # case read inside each context, rather than prefetching ahead of it.
@@ -316,7 +343,15 @@ class Storage(storage.BaseStorage):
         content = self._client.get_bytes(source)
         if content is None:
             raise storage.ComponentNotFoundError(source)
-        self._client.put(destination, content, content_type="text/calendar; charset=utf-8")
+        tag = to_collection.tag
+        content_type = (
+            "text/vcard; charset=utf-8"
+            if tag == "VADDRESSBOOK"
+            else "text/calendar; charset=utf-8"
+            if tag == "VCALENDAR"
+            else "text/plain; charset=utf-8"
+        )
+        self._client.put(destination, content, content_type=content_type)
         self._client.delete(source)
 
     @staticmethod

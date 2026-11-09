@@ -77,7 +77,7 @@ This is the same filename and JSON-shaped metadata convention used by Radicale's
 
 The plugin does not use backend ETags as the authoritative CalDAV ETag. `radicale.item.Item` derives the item ETag from serialized calendar bytes.
 
-Backend ETags may still be useful later as a performance hint to avoid unnecessary GETs, but no correctness property depends on them.
+Strong backend ETags validate the in-memory item-content cache, avoiding repeated GETs for unchanged resources after the directory listing TTL expires. Client-facing ETags are still computed by Radicale from calendar bytes. As with the storage lock, this optimization assumes all mutations go through the single Radicale process.
 
 ## Sync tokens
 
@@ -113,17 +113,10 @@ Radicale worker B ─┘
 
 Process-local locks cannot coordinate two writers. Multi-process or active-active deployment is intentionally outside this product's scope.
 
-## Short-lived read caching
+## Read caching
 
-The single Radicale process holds a 15-second in-memory cache of successful
-backing WebDAV `GET` and `PROPFIND` responses. This avoids repeatedly fetching
-all iCalendar resources when several CalDAV clients query or sync the same
-calendar. Every attempted `PUT`, `DELETE`, `MOVE`, or `MKCOL` invalidates the
-entire cache *before* performing the mutation, including when the response is
-lost or fails. Cache entries also expire automatically, and the cache is bounded.
+The plugin keeps a 15-second in-memory cache of backing WebDAV GET and PROPFIND responses. In addition, calendar item contents are retained in an LRU cache keyed by URL and strong backend ETag, bounded to 16 MiB or 1024 files. When a fresh directory listing reports an unchanged strong ETag, the item bytes are reused without another GET. Cold scans prefetch missing items with up to four concurrent reads.
 
-This is an optimization, not a source of truth: the WebDAV tree remains the
-only durable state. As with the process-wide lock, this assumes only the
-single Radicale process writes to the backing calendar directory. External
-WebDAV edits may remain invisible for up to the cache TTL; writing the
-underlying files directly is not a supported workflow.
+Write attempts invalidate the short-lived cache before the request. Item PUT, DELETE, and MOVE also invalidate the affected versioned content; collection DELETE invalidates all versioned contents. Cache state is never persisted. No direct WebDAV writes are supported while Radicale is running.
+
+Calendar scans recognize expected resource types and suffixes, ignoring unrelated .txt/.bak files while retaining correctly typed calendar resources with unconventional filenames. A malformed calendar resource with the expected suffix still surfaces a parsing error for diagnosis.
