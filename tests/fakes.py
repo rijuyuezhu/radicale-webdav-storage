@@ -76,11 +76,16 @@ class MemoryWebDAVClient:
                 )
         return result
 
-    def get(self, path: str) -> str | None:
+    def prefetch(self, entries: Iterable[WebDAVEntry]) -> None:
+        pass
+
+    def get(self, path: str, *, etag: str | None = None) -> str | None:
+        del etag
         content = self.files.get(self._clean(path))
         return None if content is None else content.decode("utf-8")
 
-    def get_bytes(self, path: str) -> bytes | None:
+    def get_bytes(self, path: str, *, etag: str | None = None) -> bytes | None:
+        del etag
         return self.files.get(self._clean(path))
 
     def put(self, path: str, content: bytes, *, content_type: str) -> None:

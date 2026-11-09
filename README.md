@@ -170,7 +170,7 @@ There is also an opt-in real-WebDAV integration test; see [`docs/testing.md`](do
 
 - Client-facing item ETags are derived by Radicale from the actual calendar bytes, not trusted from the backend WebDAV ETag.
 - The default `BaseCollection.sync()` behavior is retained. There is no persistent sync-token history; clients can fall back to normal CalDAV listing/query synchronization.
-- The plugin stores no cache or durable state locally.
+- The plugin keeps only bounded in-memory caches: short-lived directory listings and ETag-validated calendar bytes (up to 16 MiB or 1024 items). Cold calendar scans fetch missing files with at most four concurrent WebDAV reads. No local files or persistent cache are created.
 - WebDAV credentials are never intentionally logged.
 - Group collection discovery and Radicale sharing backends are not implemented by this storage plugin.
 

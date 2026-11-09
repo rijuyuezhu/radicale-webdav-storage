@@ -75,7 +75,7 @@ class Collection(storage.BaseCollection):
         href = self._item_href(entry)
         if href == _METADATA_FILENAME:
             return None
-        text = self._storage._client.get(entry.path)
+        text = self._storage._client.get(entry.path, etag=entry.etag)
         if text is None:
             return None
         return radicale_item.Item(
@@ -86,21 +86,47 @@ class Collection(storage.BaseCollection):
         )
 
     def get_all(self) -> Iterable[radicale_item.Item]:
-        for entry in self._storage._client.list(self.path):
+        entries = [
+            entry
+            for entry in self._storage._client.list(self.path)
+            if not entry.is_collection and self._item_href(entry) != _METADATA_FILENAME
+        ]
+        self._storage._client.prefetch(entries)
+        for entry in entries:
             item = self._item_from_entry(entry)
             if item is not None:
                 yield item
 
     def get_multi(self, hrefs: Iterable[str]) -> Iterable[tuple[str, radicale_item.Item | None]]:
-        for href in dict.fromkeys(hrefs):
+        unique_hrefs = list(dict.fromkeys(hrefs))
+        if not unique_hrefs:
+            return
+        if len(unique_hrefs) == 1:
+            href = unique_hrefs[0]
+            entries = (
+                {href: self._storage._client.stat(_join(self.path, href), collection=False)}
+                if pathutils.is_safe_filesystem_path_component(href)
+                else {}
+            )
+        else:
+            # A multi-get REPORT should use one directory PROPFIND, not one
+            # WebDAV PROPFIND per requested href.
+            requested = set(unique_hrefs)
+            entries = {
+                self._item_href(entry): entry
+                for entry in self._storage._client.list(self.path)
+                if not entry.is_collection and self._item_href(entry) in requested
+            }
+        valid = [
+            entry for entry in entries.values() if entry is not None and not entry.is_collection
+        ]
+        self._storage._client.prefetch(valid)
+        for href in unique_hrefs:
             if not pathutils.is_safe_filesystem_path_component(href):
                 yield href, None
                 continue
-            entry = self._storage._client.stat(_join(self.path, href), collection=False)
-            if entry is None or entry.is_collection:
-                yield href, None
-                continue
-            yield href, self._item_from_entry(entry)
+            entry = entries.get(href)
+            yield href, self._item_from_entry(entry) if entry is not None else None
 
     def upload(
         self, href: str, item: radicale_item.Item
@@ -225,6 +251,7 @@ class Storage(storage.BaseStorage):
     ) -> Iterator[types.CollectionOrItem]:
         del user_groups  # Group collection discovery is intentionally not implemented.
         sane_path = pathutils.strip_path(path)
+        has_child_context_manager = child_context_manager is not None
         if child_context_manager is None:
 
             def child_context_manager(
@@ -254,10 +281,17 @@ class Storage(storage.BaseStorage):
         if depth == "0":
             return
 
-        for entry in self._client.list(sane_path):
+        children = [
+            entry
+            for entry in self._client.list(sane_path)
+            if posixpath.basename(entry.path.rstrip("/")) != _METADATA_FILENAME
+        ]
+        # A caller-provided context may enforce per-item access. In that
+        # case read inside each context, rather than prefetching ahead of it.
+        if not has_child_context_manager:
+            self._client.prefetch(entry for entry in children if not entry.is_collection)
+        for entry in children:
             href = posixpath.basename(entry.path.rstrip("/"))
-            if href == _METADATA_FILENAME:
-                continue
             with child_context_manager(sane_path, None if entry.is_collection else href):
                 if entry.is_collection:
                     yield self._collection(entry.path, self)
