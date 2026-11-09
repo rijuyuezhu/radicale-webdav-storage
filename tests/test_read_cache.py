@@ -97,3 +97,113 @@ def test_http_failure_does_not_poison_cache() -> None:
         assert client.get("test.ics") == "OK"
         assert client.get("test.ics") == "OK"
         assert calls["GET"] == 2
+
+
+def test_strong_etag_cache_survives_ttl_and_only_refreshes_changed_items() -> None:
+    files = {"root/one.ics": b"first", "root/two.ics": b"other"}
+    calls: Counter[str] = Counter()
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        path = request.url.path.removeprefix("/")
+        calls[request.method + ":" + path] += 1
+        if request.method == "GET":
+            return httpx.Response(200, content=files[path])
+        if request.method == "PUT":
+            files[path] = request.content
+            return httpx.Response(201)
+        return httpx.Response(500)
+
+    with httpx.Client(transport=httpx.MockTransport(handle)) as http:
+        client = WebDAVClient("https://dav.example/root/", client=http)
+        assert client.get("one.ics", etag='"a"') == "first"
+        assert client.get("two.ics", etag='"b"') == "other"
+        # Expire the unversioned TTL, but the strong ETags still match.
+        client._cache.clear()
+        assert client.get("one.ics", etag='"a"') == "first"
+        assert calls["GET:root/one.ics"] == 1
+
+        # A changed ETag must not reuse even a fresh unversioned GET cache.
+        files["root/one.ics"] = b"external edit"
+        assert client.get("one.ics", etag='"a2"') == "external edit"
+        assert calls["GET:root/one.ics"] == 2
+
+        client.put("one.ics", b"local edit", content_type="text/calendar")
+        assert client.get("one.ics", etag='"a3"') == "local edit"
+        assert client.get("two.ics", etag='"b"') == "other"
+        assert calls["GET:root/one.ics"] == 3
+        assert calls["GET:root/two.ics"] == 1
+
+
+def test_weak_etags_use_short_ttl_only() -> None:
+    calls: Counter[str] = Counter()
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        calls["GET"] += 1
+        return httpx.Response(200, content=f"version {calls['GET']}".encode())
+
+    with httpx.Client(transport=httpx.MockTransport(handle)) as http:
+        client = WebDAVClient("https://dav.example/root/", client=http)
+        assert client.get("test.ics", etag='W/"weak"') == "version 1"
+        assert client.get("test.ics", etag='W/"weak"') == "version 1"
+        client._cache.clear()
+        assert client.get("test.ics", etag='W/"weak"') == "version 2"
+
+
+def test_prefetch_limits_concurrency_and_skips_unchanged_etags() -> None:
+    import threading
+    import time
+
+    from radicale_webdav_storage.webdav import WebDAVEntry
+
+    calls: Counter[str] = Counter()
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+            calls[request.url.path] += 1
+        time.sleep(0.02)
+        with lock:
+            active -= 1
+        return httpx.Response(200, content=request.url.path.encode())
+
+    entries = [
+        WebDAVEntry(path=f"file-{i}.ics", is_collection=False, etag=f'"{i}"') for i in range(12)
+    ]
+    with httpx.Client(transport=httpx.MockTransport(handle)) as http:
+        client = WebDAVClient("https://dav.example/root/", client=http)
+        client.prefetch(entries)
+        assert 1 < peak <= 4
+        assert sum(calls.values()) == 12
+
+        client._cache.clear()
+        client.prefetch(entries)
+        assert sum(calls.values()) == 12
+        assert client.get_bytes("file-0.ics", etag='"0"') == b"/root/file-0.ics"
+        assert sum(calls.values()) == 12
+
+        changed = [WebDAVEntry("file-0.ics", False, etag='"changed"'), *entries[1:]]
+        client.prefetch(changed)
+        assert sum(calls.values()) == 13
+
+
+def test_versioned_content_cache_has_bounded_entry_count() -> None:
+    calls: Counter[str] = Counter()
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        calls["GET"] += 1
+        return httpx.Response(200, content=b"tiny")
+
+    with httpx.Client(transport=httpx.MockTransport(handle)) as http:
+        client = WebDAVClient("https://dav.example/root/", client=http)
+        for n in range(1030):
+            assert client.get_bytes(f"event-{n}.ics", etag=f'"{n}"') == b"tiny"
+        assert len(client._versioned_content) == 1024
+        assert client._versioned_bytes == 1024 * 4
+        # The least recently used entry was evicted.
+        assert client.get_bytes("event-0.ics", etag='"0"') == b"tiny"
+        assert calls["GET"] == 1031

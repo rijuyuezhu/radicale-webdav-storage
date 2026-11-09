@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import threading
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
+from collections import OrderedDict
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import cast
 
@@ -52,6 +55,11 @@ class WebDAVClient:
         # the slow remote origin. No data is persisted in this cache.
         self._cache_ttl = cache_ttl
         self._cache: dict[tuple[str, str, int], tuple[float, object]] = {}
+        # A PROPFIND ETag validates a resource even after the short list cache
+        # expires. Keep only a bounded amount of immutable, versioned content.
+        self._versioned_content: OrderedDict[str, tuple[str, bytes]] = OrderedDict()
+        self._versioned_bytes = 0
+        self._version_lock = threading.Lock()
         self._owns_client = client is None
         self._client = client or httpx.Client(
             auth=(username, password) if username or password else None,
@@ -72,6 +80,39 @@ class WebDAVClient:
         if len(self._cache) >= 512:
             self._cache.clear()
         self._cache[key] = (time.monotonic() + self._cache_ttl, value)
+
+    def _versioned_get(self, url: str, etag: str) -> bytes | None:
+        with self._version_lock:
+            cached = self._versioned_content.get(url)
+            if cached is None or cached[0] != etag:
+                return None
+            self._versioned_content.move_to_end(url)
+            return cached[1]
+
+    def _versioned_remember(self, url: str, etag: str, content: bytes) -> None:
+        max_bytes = 16 * 1024 * 1024
+        if len(content) > max_bytes:
+            return
+        with self._version_lock:
+            previous = self._versioned_content.pop(url, None)
+            if previous is not None:
+                self._versioned_bytes -= len(previous[1])
+            self._versioned_content[url] = (etag, content)
+            self._versioned_bytes += len(content)
+            while self._versioned_bytes > max_bytes or len(self._versioned_content) > 1024:
+                _, (_, evicted) = self._versioned_content.popitem(last=False)
+                self._versioned_bytes -= len(evicted)
+
+    def _versioned_discard(self, *urls: str, all_entries: bool = False) -> None:
+        with self._version_lock:
+            if all_entries:
+                self._versioned_content.clear()
+                self._versioned_bytes = 0
+                return
+            for url in urls:
+                old = self._versioned_content.pop(url, None)
+                if old is not None:
+                    self._versioned_bytes -= len(old[1])
 
     def close(self) -> None:
         if self._owns_client:
@@ -193,16 +234,22 @@ class WebDAVClient:
         entries = self.propfind(clean, depth=1, collection=True)
         return [entry for entry in entries if entry.path != clean]
 
-    def get(self, path: str) -> str | None:
-        content = self.get_bytes(path)
+    def get(self, path: str, *, etag: str | None = None) -> str | None:
+        content = self.get_bytes(path, etag=etag)
         return None if content is None else content.decode("utf-8")
 
-    def get_bytes(self, path: str) -> bytes | None:
+    def get_bytes(self, path: str, *, etag: str | None = None) -> bytes | None:
         url = self._url(path)
         key = ("GET", url, 0)
-        cached = self._cached(key)
-        if cached is not None:
-            return cast(bytes, cached)
+        if etag and not etag.startswith("W/"):
+            cached_version = self._versioned_get(url, etag)
+            if cached_version is not None:
+                return cached_version
+        else:
+            cached = self._cached(key)
+            if cached is not None:
+                return cast(bytes, cached)
+        # Never use an unversioned TTL hit for a newly observed ETag.
         response = self._client.get(url)
         if response.status_code == 404:
             return None
@@ -211,12 +258,37 @@ class WebDAVClient:
                 f"GET {path!r} failed: HTTP {response.status_code} {response.reason_phrase}"
             )
         self._remember(key, response.content)
+        if etag and not etag.startswith("W/"):
+            self._versioned_remember(url, etag, response.content)
         return response.content
+
+    def prefetch(self, entries: Iterable[WebDAVEntry]) -> None:
+        """Read uncached calendar items concurrently, with bounded backend load."""
+        missing: list[WebDAVEntry] = []
+        for entry in entries:
+            if entry.is_collection:
+                continue
+            url = self._url(entry.path)
+            if entry.etag and not entry.etag.startswith("W/"):
+                if self._versioned_get(url, entry.etag) is not None:
+                    continue
+            elif self._cached(("GET", url, 0)) is not None:
+                continue
+            missing.append(entry)
+        if not missing:
+            return
+        if len(missing) == 1:
+            self.get_bytes(missing[0].path, etag=missing[0].etag)
+            return
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            # Consume the results so any failed GET aborts the scan.
+            list(pool.map(lambda entry: self.get_bytes(entry.path, etag=entry.etag), missing))
 
     def put(self, path: str, content: bytes, *, content_type: str) -> None:
         # Invalidate before the mutation: even a lost response may hide a
-        # successful backend write.
+        # successful backend write. Preserve other files' ETag-validated bytes.
         self._cache.clear()
+        self._versioned_discard(self._url(path))
         response = self._client.put(
             self._url(path),
             headers={"Content-Type": content_type},
@@ -256,6 +328,7 @@ class WebDAVClient:
 
     def delete(self, path: str, *, collection: bool = False, missing_ok: bool = True) -> None:
         self._cache.clear()
+        self._versioned_discard(self._url(path, collection=collection), all_entries=collection)
         response = self._client.request("DELETE", self._url(path, collection=collection))
         if response.status_code in {200, 202, 204}:
             return
@@ -267,6 +340,7 @@ class WebDAVClient:
 
     def move(self, source: str, destination: str) -> bool:
         self._cache.clear()
+        self._versioned_discard(self._url(source), self._url(destination))
         response = self._client.request(
             "MOVE",
             self._url(source),

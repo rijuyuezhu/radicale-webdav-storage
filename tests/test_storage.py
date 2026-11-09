@@ -176,3 +176,68 @@ def test_invalid_lock_mode_is_rejected() -> None:
     backend, _ = make_storage()
     with pytest.raises(ValueError, match="invalid storage lock mode"), backend.acquire_lock("x"):
         pass
+
+
+def test_multiget_uses_one_webdav_listing_and_preserves_order() -> None:
+    backend, fake = make_storage()
+    collection = create_calendar(backend)
+    collection.upload("first.ics", Item(collection=collection, href="first.ics", text=EVENT))
+    collection.upload("second.ics", Item(collection=collection, href="second.ics", text=EVENT_2))
+
+    calls: dict[str, int] = {"list": 0, "stat": 0}
+    original_list = fake.list
+    original_stat = fake.stat
+
+    def tracking_list(path: str):
+        calls["list"] += 1
+        return original_list(path)
+
+    def tracking_stat(path: str, *, collection: bool):
+        calls["stat"] += 1
+        return original_stat(path, collection=collection)
+
+    fake.list = tracking_list  # type: ignore[method-assign]
+    fake.stat = tracking_stat  # type: ignore[method-assign]
+
+    found = list(
+        collection.get_multi(
+            ["second.ics", "missing.ics", "first.ics", "second.ics", "../unsafe.ics"]
+        )
+    )
+    assert [href for href, _ in found] == [
+        "second.ics",
+        "missing.ics",
+        "first.ics",
+        "../unsafe.ics",
+    ]
+    assert [item.uid if item else None for _, item in found] == ["event-2", None, "event-1", None]
+    assert calls == {"list": 1, "stat": 0}
+
+
+def test_empty_multiget_does_not_list_backend() -> None:
+    backend, fake = make_storage()
+    collection = create_calendar(backend)
+    assert list(collection.get_multi([])) == []
+
+
+def test_discovery_preserves_per_item_context_before_read() -> None:
+    from contextlib import contextmanager
+
+    backend, fake = make_storage()
+    collection = create_calendar(backend)
+    collection.upload("event.ics", Item(collection=collection, href="event.ics", text=EVENT))
+
+    def forbid_prefetch(_entries):
+        raise AssertionError("prefetch would bypass the item context")
+
+    fake.prefetch = forbid_prefetch  # type: ignore[method-assign]
+    observed: list[str | None] = []
+
+    @contextmanager
+    def authorized(_path: str, href: str | None):
+        observed.append(href)
+        yield
+
+    found = list(backend.discover("/alice/personal/", depth="1", child_context_manager=authorized))
+    assert len(found) == 2
+    assert observed == ["event.ics"]
