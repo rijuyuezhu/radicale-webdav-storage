@@ -241,3 +241,59 @@ def test_discovery_preserves_per_item_context_before_read() -> None:
     found = list(backend.discover("/alice/personal/", depth="1", child_context_manager=authorized))
     assert len(found) == 2
     assert observed == ["event.ics"]
+
+
+def test_unrelated_webdav_files_are_ignored_in_calendar_scans() -> None:
+    backend, fake = make_storage()
+    calendar = create_calendar(backend)
+    calendar.upload("normal.ics", Item(collection=calendar, href="normal.ics", text=EVENT))
+    fake.put("alice/personal/notes.txt", b"not an iCalendar", content_type="text/plain")
+    fake.put("alice/personal/backup.bak", b"broken", content_type="application/octet-stream")
+    fake.put("alice/personal/foreign.vcf", b"wrong collection", content_type="text/vcard")
+
+    assert [item.href for item in calendar.get_all()] == ["normal.ics"]
+    assert calendar.has_uid("event-1")
+    assert not calendar.has_uid("not-present")
+    assert [obj.href for obj in list(backend.discover("/alice/personal/", depth="1"))[1:]] == [
+        "normal.ics"
+    ]
+    assert [
+        (name, item is not None)
+        for name, item in calendar.get_multi(
+            ["notes.txt", "normal.ics", "backup.bak", "foreign.vcf"]
+        )
+    ] == [("notes.txt", False), ("normal.ics", True), ("backup.bak", False), ("foreign.vcf", False)]
+
+
+def test_calendar_resource_without_ics_suffix_uses_content_type() -> None:
+    backend, fake = make_storage()
+    calendar = create_calendar(backend)
+    fake.put("alice/personal/opaque-name", EVENT.encode(), content_type="text/calendar")
+    fake.put("alice/personal/alternate.txt", EVENT_2.encode(), content_type="text/calendar")
+    fake.put("alice/personal/octet.ics", EVENT_2.encode(), content_type="application/octet-stream")
+
+    assert {item.href for item in calendar.get_all()} == {
+        "opaque-name",
+        "alternate.txt",
+        "octet.ics",
+    }
+
+
+def test_move_fallback_preserves_vcard_content_type() -> None:
+    backend, fake = make_storage()
+    backend.create_collection("/alice/")
+    source, _, _ = backend.create_collection("/alice/contacts/", props={"tag": "VADDRESSBOOK"})
+    target, _, _ = backend.create_collection(
+        "/alice/other-contacts/", props={"tag": "VADDRESSBOOK"}
+    )
+    vcard = "\r\n".join(
+        ["BEGIN:VCARD", "VERSION:3.0", "UID:contact-1", "FN:Example", "END:VCARD", ""]
+    )
+    uploaded, _ = source.upload(
+        "person.vcf", Item(collection=source, href="person.vcf", text=vcard)
+    )
+    fake.move = lambda _source, _destination: False  # type: ignore[method-assign]
+    backend.move(uploaded, target, "moved.vcf")
+    assert "alice/contacts/person.vcf" not in fake.files
+    assert fake.content_types["alice/other-contacts/moved.vcf"] == ("text/vcard; charset=utf-8")
+    assert fake.files["alice/other-contacts/moved.vcf"].decode() == vcard

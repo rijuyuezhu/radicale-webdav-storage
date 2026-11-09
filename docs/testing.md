@@ -16,7 +16,10 @@ It covers:
 - collection creation and metadata;
 - item upload, replacement, discovery, move, and verification;
 - safe parsing of the credentials file;
-- a real Radicale WSGI request path for `MKCALENDAR`, `PUT`, stale `If-Match`, and `GET`.
+- a real Radicale WSGI request path for `MKCALENDAR`, `PUT`, stale `If-Match`, and `GET`;
+- ETag-validated cache invalidation and bounded parallel prefetch;
+- strict WebDAV `stat` and split successful `propstat` handling;
+- filtering unrelated files and preserving vCard MIME types on MOVE fallback.
 
 The Radicale request test is important because it verifies the concurrency assumption: stale client writes are rejected by Radicale before the plugin sends the backend PUT.
 
